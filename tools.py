@@ -1,6 +1,11 @@
 """
 tools.py — Herramientas formales del agente
-Cada tool es una acción que el agente puede planificar y ejecutar
+Cambios vs versión anterior:
+  - FIX: `todos_excluidos` ya no se borra antes de guardarse en memoria/historial
+  - Memoria persistente en una tab del Sheet ("Memoria_Agente") con fallback a archivo
+    (el disco de Streamlit Cloud es efímero: memory.json se perdía en cada redeploy)
+  - `estado_sistema()` es función normal (no tool): el agente ya no gasta una
+    llamada al LLM en consultar el estado — se inyecta al system prompt
 """
 import json
 import io
@@ -15,7 +20,8 @@ from google.oauth2.service_account import Credentials
 # ─── Estado compartido (se inyecta desde app.py) ──────────────────────────────
 _creds_info = None
 _sheet_id = None
-MEMORY_FILE = "memory.json"
+MEMORY_FILE = "memory.json"          # fallback local si la tab no existe
+MEMORIA_TAB = "Memoria_Agente"
 TEMPLATE_PATH = "FORMATO_CONSTANCIA_DE_SERVICIO__1_.docx"
 
 MESES_ES = {
@@ -31,23 +37,49 @@ def configurar(creds_info: dict, sheet_id: str):
 
 
 # ─── Helpers internos ─────────────────────────────────────────────────────────
-def _cargar_memoria() -> dict:
-    if Path(MEMORY_FILE).exists():
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+def _gc(scopes):
+    creds = Credentials.from_service_account_info(_creds_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+def _memoria_default() -> dict:
     hoy = date.today()
-    q = (hoy.day <= 15) and (hoy.month * 2 - 1) or (hoy.month * 2)
+    q = (hoy.month * 2 - 1) if hoy.day <= 15 else (hoy.month * 2)
     return {"ultima_quincena": q, "ultimo_anio": hoy.year,
             "exclusiones_permanentes": [], "historial": []}
 
+def _ws_memoria():
+    gc = _gc(["https://www.googleapis.com/auth/spreadsheets"])
+    sh = gc.open_by_key(_sheet_id)
+    try:
+        return sh.worksheet(MEMORIA_TAB)
+    except gspread.WorksheetNotFound:
+        return sh.add_worksheet(MEMORIA_TAB, rows=2, cols=1)
+
+def _cargar_memoria() -> dict:
+    # 1) Tab del Sheet (sobrevive redeploys de Streamlit Cloud)
+    try:
+        raw = _ws_memoria().acell("A1").value
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        pass
+    # 2) Fallback: archivo local (solo dura mientras vive el contenedor)
+    if Path(MEMORY_FILE).exists():
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return _memoria_default()
+
 def _guardar_memoria(mem: dict):
+    payload = json.dumps(mem, ensure_ascii=False)
+    try:
+        _ws_memoria().update_acell("A1", payload)
+    except Exception:
+        pass  # si el Sheet falla, al menos queda el archivo local
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(mem, f, ensure_ascii=False, indent=2)
+        f.write(payload)
 
 def _obtener_empleados() -> list[dict]:
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    creds = Credentials.from_service_account_info(_creds_info, scopes=scopes)
-    gc = gspread.authorize(creds)
+    gc = _gc(["https://www.googleapis.com/auth/spreadsheets.readonly"])
     ws = gc.open_by_key(_sheet_id).worksheet("Constancias")
     return ws.get_all_records()
 
@@ -72,56 +104,52 @@ def _reemplazar_en_doc(doc, reemplazos: dict):
                     en_parrafo(p)
 
 
-# ─── TOOLS FORMALES ───────────────────────────────────────────────────────────
-
-@tool
-def consultar_estado() -> str:
-    """
-    Consulta el estado actual del sistema: última quincena generada,
-    año, exclusiones permanentes y total de empleados disponibles.
-    Úsala siempre antes de planificar una generación.
-    """
+# ─── ESTADO DEL SISTEMA (función normal, NO tool) ────────────────────────────
+def estado_sistema() -> dict:
+    """Estado actual para inyectar al system prompt. Cero costo de LLM."""
     mem = _cargar_memoria()
     try:
         empleados = _obtener_empleados()
         total = len(empleados)
-        excluidos = mem["exclusiones_permanentes"]
-        disponibles = total - len(excluidos)
-    except Exception as e:
-        return f"Error al leer empleados: {e}"
-
-    return json.dumps({
-        "ultima_quincena": mem["ultima_quincena"],
-        "ultimo_anio": mem["ultimo_anio"],
+    except Exception:
+        total = -1
+    excluidos = mem.get("exclusiones_permanentes", [])
+    return {
+        "ultima_quincena": mem.get("ultima_quincena"),
+        "ultimo_anio": mem.get("ultimo_anio"),
         "total_empleados": total,
-        "disponibles_para_generar": disponibles,
+        "disponibles_para_generar": (total - len(excluidos)) if total >= 0 else -1,
         "exclusiones_permanentes": excluidos,
-        "siguiente_quincena_sugerida": (mem["ultima_quincena"] % 24) + 1,
-        "fecha_hoy": date.today().isoformat()
-    }, ensure_ascii=False)
+        "siguiente_quincena_sugerida": (mem.get("ultima_quincena", 0) % 24) + 1,
+        "fecha_hoy": date.today().isoformat(),
+    }
 
+
+# ─── TOOLS FORMALES ───────────────────────────────────────────────────────────
 
 @tool
 def generar_constancias(
     quincena: int,
     anio: int,
     fecha_emision: str,
-    excluidos_sesion: list[str] = [],
-    incluir_solo: list[str] = []
+    excluidos_sesion: list[str] | None = None,
+    incluir_solo: list[str] | None = None
 ) -> str:
     """
     Genera las constancias de servicio en formato Word (.docx) empaquetadas en un ZIP.
-    
+
     Args:
         quincena: Número de quincena (1-24)
         anio: Año (ej: 2026)
         fecha_emision: Fecha del documento en formato YYYY-MM-DD
         excluidos_sesion: Lista de nombres completos a excluir SOLO esta vez (no permanente)
         incluir_solo: Si se especifica, genera SOLO para estos empleados (ignora excluidos_sesion)
-    
+
     Returns:
         Mensaje con el resultado y la ruta del ZIP generado.
     """
+    excluidos_sesion = excluidos_sesion or []
+    incluir_solo = incluir_solo or []
     try:
         empleados = _obtener_empleados()
         mem = _cargar_memoria()
@@ -129,10 +157,10 @@ def generar_constancias(
 
         if incluir_solo:
             filtrados = [e for e in empleados if e.get("Nombre Completo", "") in incluir_solo]
+            todos_excluidos = set()
         else:
             todos_excluidos = set(mem["exclusiones_permanentes"] + excluidos_sesion)
             filtrados = [e for e in empleados if e.get("Nombre Completo", "") not in todos_excluidos]
-        todos_excluidos = set()
 
         if not filtrados:
             return "Error: no hay empleados disponibles después de aplicar exclusiones."
@@ -167,7 +195,7 @@ def generar_constancias(
         with open(zip_path, "wb") as f:
             f.write(buf_zip.getvalue())
 
-        # Actualizar memoria
+        # Actualizar memoria (todos_excluidos ya NO se borra antes de llegar aquí)
         mem["ultima_quincena"] = quincena
         mem["ultimo_anio"] = anio
         mem["historial"].append({
@@ -175,7 +203,8 @@ def generar_constancias(
             "quincena": quincena,
             "anio": anio,
             "generados": len(filtrados),
-            "excluidos": list(todos_excluidos)
+            "incluir_solo": incluir_solo,
+            "excluidos": sorted(todos_excluidos),
         })
         _guardar_memoria(mem)
 
@@ -185,7 +214,7 @@ def generar_constancias(
             "quincena": quincena,
             "anio": anio,
             "fecha_emision": _fecha_larga(fecha),
-            "excluidos": list(todos_excluidos),
+            "excluidos": sorted(todos_excluidos),
             "zip_path": zip_path
         }, ensure_ascii=False)
 
@@ -197,12 +226,12 @@ def generar_constancias(
 def excluir_empleados(nombres: list[str], permanente: bool = False) -> str:
     """
     Excluye empleados de futuras generaciones.
-    
+
     Args:
         nombres: Lista de nombres completos a excluir
         permanente: Si True, se guardan en memoria y aplican siempre.
                    Si False, solo aplica en la siguiente generación.
-    
+
     Returns:
         Confirmación de los cambios realizados.
     """
@@ -230,10 +259,10 @@ def excluir_empleados(nombres: list[str], permanente: bool = False) -> str:
 def reactivar_empleados(nombres: list[str]) -> str:
     """
     Reactiva empleados que estaban excluidos permanentemente.
-    
+
     Args:
         nombres: Lista de nombres completos a reactivar
-    
+
     Returns:
         Confirmación de los cambios.
     """
@@ -252,17 +281,15 @@ def reactivar_empleados(nombres: list[str]) -> str:
     }, ensure_ascii=False)
 
 
-
-
 @tool
 def buscar_empleado(nombre_aproximado: str) -> str:
     """
     Busca un empleado por nombre aproximado en la lista.
     Úsala SOLO cuando el usuario pida una constancia para alguien específico.
-    
+
     Args:
         nombre_aproximado: Nombre completo o parcial del empleado
-    
+
     Returns:
         Nombre exacto del empleado encontrado.
     """
@@ -280,5 +307,7 @@ def buscar_empleado(nombre_aproximado: str) -> str:
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-# Lista exportable de todas las tools
-TOOLS = [consultar_estado, buscar_empleado, generar_constancias, excluir_empleados, reactivar_empleados]
+
+# Lista exportable — consultar_estado ya no existe como tool:
+# el estado se inyecta al system prompt vía estado_sistema()
+TOOLS = [buscar_empleado, generar_constancias, excluir_empleados, reactivar_empleados]
